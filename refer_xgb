@@ -1,0 +1,278 @@
+markdown
+# End-to-End XGBoost 2.1.4 Large-Scale Training & Inference Plan (Strict Float32)
+
+## 1. Hardware & Resource Budget
+* **Source Storage:** Google Cloud Storage (GCS) — ~400GB+ compressed Parquet (`float32` schema)
+* **Compute:** 16-Core CPU, 64GB System RAM
+* **Local Cache Disk:** 200GB NVMe/SSD mount (strictly for compressed quantized bin pages)
+* **Accelerator:** 1x NVIDIA L4 GPU (24GB VRAM)
+
+| Resource | Physical Limit | Safe Working Target | Pipeline Role |
+| :--- | :--- | :--- | :--- |
+| **GCS Bucket** | Unlimited | Raw `f32` Parquet Shards | Source of truth & prediction sink (zero local raw files) |
+| **System RAM** | 64 GB | **< 45 GB** | Holds 1 unpacked `f32` batch (~1.5GB) + quantile sketches |
+| **Local Disk** | 200 GB | **< 150 GB** | Stores quantized `uint8` bin pages (~4x compression from `f32`) |
+| **L4 GPU VRAM** | 24 GB | **< 18 GB** | Receives quantized pages on-the-fly for histogram splits |
+
+---
+
+## 2. Environment Setup (Run Before Execution)
+Run these commands on your workbench terminal to verify disk mounts, clear stale cache, and prevent CUDA VRAM fragmentation:
+
+```bash
+# 1. Verify your 200GB cache disk mount point (do NOT use root '/' if it is <100GB)
+df -h
+
+# 2. Create and clean the dedicated cache directory
+mkdir -p /mnt/disks/cache/xgb_f32_cache
+rm -rf /mnt/disks/cache/xgb_f32_cache/*
+
+# 3. Set CUDA async memory allocator flags for L4 GPU
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export RMM_ALLOCATOR=cuda_async
+
+# 4. Verify required package versions
+pip install --upgrade "xgboost==2.1.4" pyarrow gcsfs numpy
+```
+
+---
+
+## 3. Anti-Expansion & Memory Control Strategy
+1. **Parquet Decompression Expansion (`GCS` → `RAM`):**
+   * Bypass Pandas completely to avoid duplicate DataFrame/NumPy copies and silent `float64` upcasting.
+   * Stream fixed row chunks via `pyarrow.parquet.ParquetFile.iter_batches()`, sized so each contiguous `float32` batch stays around **1.5 GB** in RAM:
+     `BATCH_ROWS = int((1.5 * 1024**3) / (NUM_FEATURES * 4))`
+2. **Quantization Expansion (`RAM` → `200GB Disk`):**
+   * Use `xgb.ExtMemQuantileDMatrix` with `max_bin=64` (or `128`) to compress 4-byte `float32` values into 1-byte `uint8` bin indices.
+   * Set `min_cache_page_bytes = 512 * 1024 * 1024` (512MB) to flush quantized pages to the 200GB disk frequently instead of holding them in RAM/VRAM.
+   * Cap `nthread=8` during matrix construction to avoid parallel sketch merging spikes.
+3. **Histogram & Tree Expansion (`200GB Disk` → `L4 VRAM`):**
+   * Use `grow_policy="lossguide"` with `max_leaves=64` instead of deep depthwise trees to place a hard ceiling on active histogram nodes in VRAM.
+   * Use `sampling_method="gradient_based"` with `subsample=0.5` to drop low-gradient rows on the L4 GPU before histogram construction.
+   * Set `max_cached_hist_node=32768` to cap parent histogram caching in VRAM.
+
+---
+
+## 4. Complete Production Script (`train_and_predict_f32.py`)
+
+```python
+import os
+import gc
+import glob
+import shutil
+import gcsfs
+import pyarrow as pa
+import pyarrow.parquet as pq
+import numpy as np
+import xgboost as xgb
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+TRAIN_GCS_GLOB = "gs://your-bucket/train-f32/*.parquet"
+INFER_GCS_GLOB = "gs://your-bucket/infer-f32/*.parquet"
+PRED_OUT_GCS_DIR = "gs://your-bucket/predictions-f32"
+CHECKPOINT_GCS_DIR = "gs://your-bucket/models/checkpoints"
+MODEL_OUT_GCS = "gs://your-bucket/models/xgb_f32_final.json"
+
+CACHE_DIR = "/mnt/disks/cache/xgb_f32_cache"  # Must point to 200GB cache disk
+ID_COL = "id"
+TARGET_COL = "target"
+DROP_COLS = [ID_COL, TARGET_COL]
+
+# Target ~1.5GB per batch in RAM (e.g., 500k rows * 800 float32 cols * 4B = 1.6GB)
+BATCH_ROWS = 500_000
+MAX_BIN = 64  # Use 64 for tightest memory footprint, or 128 if disk/VRAM allows
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+for f in glob.glob(f"{CACHE_DIR}/*"):
+    os.remove(f)
+
+fs = gcsfs.GCSFileSystem()
+
+# ==============================================================================
+# 1. STRICT FLOAT32 SCHEMA VALIDATOR
+# ==============================================================================
+def get_verified_f32_columns(sample_gcs_path, fs, drop_cols, target_col=None):
+    with fs.open(sample_gcs_path, "rb") as f:
+        schema = pq.ParquetFile(f).schema_arrow
+
+    feature_cols = []
+    for field in schema:
+        if field.name in drop_cols:
+            continue
+        assert pa.types.is_float32(field.type), (
+            f"Schema Error: '{field.name}' is {field.type}, expected float32."
+        )
+        feature_cols.append(field.name)
+
+    if target_col and target_col in schema.names:
+        target_type = schema.field(target_col).type
+        assert pa.types.is_float32(target_type), (
+            f"Schema Error: Target '{target_col}' is {target_type}, expected float32."
+        )
+    return feature_cols
+
+# ==============================================================================
+# 2. ZERO-OVERHEAD FLOAT32 STREAMING ITERATOR
+# ==============================================================================
+class StrictFloat32Iter(xgb.DataIter):
+    def __init__(self, gcs_files, fs, feature_cols, target_col, batch_rows, cache_prefix):
+        self.gcs_files = gcs_files
+        self.fs = fs
+        self.feature_cols = feature_cols
+        self.target_col = target_col
+        self.batch_rows = batch_rows
+        self._gen = None
+        super().__init__(cache_prefix=cache_prefix)
+
+    def _batch_generator(self):
+        cols_to_read = self.feature_cols + [self.target_col]
+        for file_path in self.gcs_files:
+            with self.fs.open(file_path, "rb") as f:
+                pf = pq.ParquetFile(f)
+                for batch in pf.iter_batches(batch_size=self.batch_rows, columns=cols_to_read):
+                    y = batch.column(self.target_col).to_numpy(zero_copy_only=False)
+                    assert y.dtype == np.float32
+
+                    X = np.empty((batch.num_rows, len(self.feature_cols)), dtype=np.float32)
+                    for i, col in enumerate(self.feature_cols):
+                        X[:, i] = batch.column(col).to_numpy(zero_copy_only=False)
+
+                    yield X, y
+                    del X, y, batch
+                    gc.collect()
+
+    def next(self, input_data):
+        if self._gen is None:
+            self._gen = self._batch_generator()
+        try:
+            X, y = next(self._gen)
+            # Use missing=0.0 instead of np.nan if your dataset is zero-sparse
+            input_data(data=X, label=y, missing=np.nan)
+            del X, y
+            gc.collect()
+            return 1
+        except StopIteration:
+            return 0
+
+    def reset(self):
+        self._gen = None
+
+# ==============================================================================
+# 3. GCS CHECKPOINT CALLBACK
+# ==============================================================================
+class GCSCheckpointCallback(xgb.callback.TrainingCallback):
+    def __init__(self, gcs_out_dir, fs, period=25):
+        self.gcs_out_dir = gcs_out_dir
+        self.fs = fs
+        self.period = period
+
+    def after_iteration(self, model, epoch, evals_log):
+        if (epoch + 1) % self.period == 0:
+            local_tmp = f"/tmp/xgb_f32_round_{epoch+1}.json"
+            model.save_model(local_tmp)
+            self.fs.put(local_tmp, f"{self.gcs_out_dir}/xgb_f32_round_{epoch+1}.json")
+            os.remove(local_tmp)
+        return False
+
+# ==============================================================================
+# 4. BUILD EXTERNAL QUANTIZED MATRIX & TRAIN ON L4 GPU
+# ==============================================================================
+train_files = sorted(fs.glob(TRAIN_GCS_GLOB))
+assert len(train_files) > 0, "No training Parquet files found in GCS."
+
+feature_cols = get_verified_f32_columns(train_files[0], fs, DROP_COLS, TARGET_COL)
+print(f"Verified {len(feature_cols)} float32 features across {len(train_files)} GCS shards.")
+
+it = StrictFloat32Iter(
+    gcs_files=train_files,
+    fs=fs,
+    feature_cols=feature_cols,
+    target_col=TARGET_COL,
+    batch_rows=BATCH_ROWS,
+    cache_prefix=os.path.join(CACHE_DIR, "train_f32")
+)
+
+dtrain = xgb.ExtMemQuantileDMatrix(
+    it,
+    max_bin=MAX_BIN,
+    missing=np.nan,
+    nthread=8,                               # Caps RAM spike during sketch merging
+    min_cache_page_bytes=512 * 1024 * 1024   # Flushes to 200GB disk every 512MB
+)
+
+params = {
+    "objective": "binary:logistic",          # Adjust to reg:squarederror if regression
+    "eval_metric": "auc",
+    "tree_method": "hist",
+    "device": "cuda",                        # Runs on 24GB NVIDIA L4 GPU
+    "max_bin": MAX_BIN,
+    "grow_policy": "lossguide",              # Prevents exponential depthwise VRAM spikes
+    "max_leaves": 64,                        # Hard ceiling on active histogram nodes
+    "learning_rate": 0.05,
+    "subsample": 0.5,
+    "sampling_method": "gradient_based",     # L4 GPU optimization: keeps high-gradient rows
+    "colsample_bytree": 0.7,
+    "colsample_bynode": 0.7,
+    "max_cached_hist_node": 32768            # Caps GPU histogram cache size
+}
+
+booster = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=500,
+    callbacks=[GCSCheckpointCallback(CHECKPOINT_GCS_DIR, fs, period=25)]
+)
+
+# Save final model to GCS & wipe 200GB cache disk before inference
+booster.save_model("/tmp/xgb_f32_final.json")
+fs.put("/tmp/xgb_f32_final.json", MODEL_OUT_GCS)
+os.remove("/tmp/xgb_f32_final.json")
+
+del dtrain, it
+shutil.rmtree(CACHE_DIR, ignore_errors=True)
+gc.collect()
+print("Training complete. Cache wiped and model saved to GCS.")
+
+# ==============================================================================
+# 5. BATCH INFERENCE & STRICT FLOAT32 PARQUET WRITE TO GCS
+# ==============================================================================
+Use code with caution.
+infer_files = sorted(fs.glob(INFER_GCS_GLOB))
+out_schema = pa.schema([
+pa.field(ID_COL, pa.int64()),            # Adjust if ID column is string/int32
+pa.field("prediction", pa.float32())     # Enforces strict 32-bit float output
+])
+for shard_idx, file_path in enumerate(infer_files):
+out_gcs_path = f"{PRED_OUT_GCS_DIR}/pred_part_{shard_idx:05d}.parquet"
+with fs.open(file_path, "rb") as f_in, fs.open(out_gcs_path, "wb") as f_out:
+pf = pq.ParquetFile(f_in)
+with pq.ParquetWriter(f_out, out_schema, compression="snappy") as writer:
+for batch in pf.iter_batches(batch_size=BATCH_ROWS, columns=[ID_COL] + feature_cols):
+ids_arr = batch.column(ID_COL)
+X = np.empty((batch.num_rows, len(feature_cols)), dtype=np.float32)
+for i, col in enumerate(feature_cols):
+X[:, i] = batch.column(col).to_numpy(zero_copy_only=False)
+# Runs directly on L4 GPU without creating a DMatrix; outputs float32
+preds_f32 = booster.inplace_predict(X, missing=np.nan)
+assert preds_f32.dtype == np.float32
+out_table = pa.Table.from_arrays(
+[ids_arr, pa.array(preds_f32, type=pa.float32())],
+schema=out_schema
+)
+writer.write_table(out_table)
+del X, preds_f32, out_table, batch
+gc.collect()
+print(f"Inference complete. Strict float32 predictions written to {PRED_OUT_GCS_DIR}.")
+```
+
+5. Quick Troubleshooting Reference
+
+• OOM during ExtMemQuantileDMatrix init: Reduce BATCH_ROWS by 50%, lower nthread from 8 to 4, or drop min_cache_page_bytes to 256 * 1024 * 1024.
+• OOM during xgb.train iterations: Lower max_leaves from 64 to 32, reduce subsample to 0.4, or set max_cached_hist_node to 16384.
+• 200GB Disk Full Error: Confirm CACHE_DIR is mounted on the 200GB disk (df -h /mnt/disks/cache) and change MAX_BIN from 128 to 64. If features are sparse, switch missing=np.nan to missing=0.0.
+
+<FollowUp>
+If you'd like to test this on a small subset before running the full 400GB+ job, I can add a **dry-run validation mode** (reading just the first 2 GCS shards with memory profiling logs) to verify peak RAM, disk, and L4 VRAM usage. Would you like that snippet?
+</FollowUp>
